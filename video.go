@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -35,9 +36,14 @@ type stream struct {
 	CodecType   string `json:"codec_type"`
 	CodecName   string `json:"codec_name"`
 	PixFmt      string `json:"pix_fmt"`
+	Width       int    `json:"width"`
+	Height      int    `json:"height"`
 	Disposition struct {
 		AttachedPic int `json:"attached_pic"`
 	} `json:"disposition"`
+	Tags struct {
+		Language string `json:"language"`
+	} `json:"tags"`
 }
 
 type probe struct {
@@ -57,11 +63,40 @@ func ffprobe(ctx context.Context, in string) (p probe, err error) {
 	return p, json.Unmarshal(out, &p)
 }
 
+// pick — какие дорожки типа typ оставить по списку языков. Пустой список — все, none — ни одной.
+// Язык сравнивается по началу: ru подходит к rus, en к eng.
+func pick(ss []stream, typ, label string, langs []string, warns *[]string) map[int]bool {
+	all, match := map[int]bool{}, map[int]bool{}
+	for _, s := range ss {
+		if s.CodecType != typ {
+			continue
+		}
+		all[s.Index] = true
+		for _, l := range langs {
+			if strings.HasPrefix(strings.ToLower(s.Tags.Language), l) {
+				match[s.Index] = true
+			}
+		}
+	}
+	switch {
+	case len(langs) == 0:
+		return all
+	case slices.Contains(langs, "none"):
+		return map[int]bool{}
+	case len(match) == 0 && len(all) > 0:
+		*warns = append(*warns, fmt.Sprintf("нет %s на языке %s — оставлены все", label, strings.Join(langs, ",")))
+		return all
+	}
+	return match
+}
+
 // buildArgs решает по каждой дорожке: копировать, перекодировать или пропустить.
-func buildArgs(p probe, toMP4, compress bool, q int) (args, warns []string) {
+func buildArgs(p probe, toMP4 bool, o opts, q int) (args, warns []string) {
+	keepA := pick(p.Streams, "audio", "звука", o.audio, &warns)
+	keepS := pick(p.Streams, "subtitle", "субтитров", o.subs, &warns)
 	n := 0
 	for _, s := range p.Streams {
-		o := strconv.Itoa(n)
+		o2 := strconv.Itoa(n)
 		var c []string
 		switch s.CodecType {
 		case "video":
@@ -69,32 +104,43 @@ func buildArgs(p probe, toMP4, compress bool, q int) (args, warns []string) {
 				continue // обложки
 			}
 			codec := s.CodecName
-			if compress || (toMP4 && !mp4Video[codec]) {
+			if o.compress || (toMP4 && !mp4Video[codec]) {
 				codec = "hevc"
-				c = []string{"-c:" + o, "hevc_videotoolbox", "-q:" + o, strconv.Itoa(q)}
+				c = []string{"-c:" + o2, "hevc_videotoolbox", "-q:" + o2, strconv.Itoa(q)}
 				if strings.Contains(s.PixFmt, "10") {
-					c = append(c, "-profile:"+o, "main10", "-pix_fmt:"+o, "p010le")
+					c = append(c, "-profile:"+o2, "main10", "-pix_fmt:"+o2, "p010le")
+				}
+				if o.res > 0 {
+					// По меньшей стороне, чтобы вертикальные видео тоже стали «1080p»; маленькие не увеличиваем.
+					r := strconv.Itoa(o.res)
+					c = append(c, "-filter:"+o2, "scale=w='if(gt(iw,ih),-2,min(iw,"+r+"))':h='if(gt(iw,ih),min(ih,"+r+"),-2)'")
 				}
 			} else {
-				c = []string{"-c:" + o, "copy"}
+				c = []string{"-c:" + o2, "copy"}
 			}
 			if toMP4 && codec == "hevc" {
-				c = append(c, "-tag:"+o, "hvc1") // без этого HEVC не играет на Mac/iPhone
+				c = append(c, "-tag:"+o2, "hvc1") // без этого HEVC не играет на Mac/iPhone
 			}
 		case "audio":
+			if !keepA[s.Index] {
+				continue
+			}
 			if toMP4 && !mp4Audio[s.CodecName] {
-				c = []string{"-c:" + o, "aac_at", "-b:" + o, "256k"}
+				c = []string{"-c:" + o2, "aac_at", "-b:" + o2, "256k"}
 			} else {
-				c = []string{"-c:" + o, "copy"}
+				c = []string{"-c:" + o2, "copy"}
 			}
 		case "subtitle":
+			if !keepS[s.Index] {
+				continue
+			}
 			switch {
 			case !toMP4 && s.CodecName == "mov_text":
-				c = []string{"-c:" + o, "srt"}
+				c = []string{"-c:" + o2, "srt"}
 			case !toMP4:
-				c = []string{"-c:" + o, "copy"}
+				c = []string{"-c:" + o2, "copy"}
 			case textSubs[s.CodecName]:
-				c = []string{"-c:" + o, "mov_text"}
+				c = []string{"-c:" + o2, "mov_text"}
 			default:
 				warns = append(warns, fmt.Sprintf("субтитры #%d (%s) не поддерживаются в MP4 — пропущены", s.Index, s.CodecName))
 				continue
@@ -109,36 +155,51 @@ func buildArgs(p probe, toMP4, compress bool, q int) (args, warns []string) {
 	return args, warns
 }
 
-func convertVideo(ctx context.Context, o opts, in, part string, toMP4 bool) error {
-	p, err := ffprobe(ctx, in)
-	if err != nil {
-		return err
+// layout — «отпечаток» устройства файла: склеивать без перекодирования можно только одинаковые.
+func layout(p probe) string {
+	var b strings.Builder
+	for _, s := range p.Streams {
+		fmt.Fprintf(&b, "%s/%s/%dx%d ", s.CodecType, s.CodecName, s.Width, s.Height)
+	}
+	return b.String()
+}
+
+func convertVideo(ctx context.Context, o opts, ins []string, part string, toMP4 bool) error {
+	var p probe
+	var dur float64
+	for i, in := range ins {
+		pi, err := ffprobe(ctx, in)
+		if err != nil {
+			return fmt.Errorf("%s: %w", in, err)
+		}
+		if i == 0 {
+			p = pi
+		} else if layout(pi) != layout(p) {
+			return fmt.Errorf("%s и %s устроены по-разному (кодеки, разрешение или число дорожек) — склеить нельзя", ins[0], in)
+		}
+		d, _ := strconv.ParseFloat(pi.Format.Duration, 64)
+		dur += d
 	}
 	q := o.q
 	if q == 0 {
 		q = 60
 	}
-	args, warns := buildArgs(p, toMP4, o.compress, q)
+	args, warns := buildArgs(p, toMP4, o, q)
 	for _, w := range warns {
-		fmt.Fprintf(os.Stderr, "cv: %s: %s\n", in, w)
+		fmt.Fprintf(os.Stderr, "cv: %s: %s\n", ins[0], w)
 	}
 	if len(args) == 0 {
 		return fmt.Errorf("нет дорожек для конвертации")
 	}
+	inSize := totalSize(ins...)
 	if !o.compress { // remux пишет примерно столько же, сколько весит исходник
-		fi, err := os.Stat(in)
 		var st syscall.Statfs_t
-		if err == nil && syscall.Statfs(filepath.Dir(part), &st) == nil {
-			if free := st.Bavail * uint64(st.Bsize); free < uint64(fi.Size()) {
-				return fmt.Errorf("мало места: нужно ~%s, свободно %s", human(uint64(fi.Size())), human(free))
+		if syscall.Statfs(filepath.Dir(part), &st) == nil {
+			if free := int64(st.Bavail) * int64(st.Bsize); free < inSize {
+				return fmt.Errorf("мало места: нужно ~%s, свободно %s", human(inSize), human(free))
 			}
 		}
 	}
-	format := "matroska"
-	if toMP4 {
-		format = "mp4"
-	}
-	dur, _ := strconv.ParseFloat(p.Format.Duration, 64)
 	full := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-nostats", "-progress", "pipe:1"}
 	if o.from > 0 {
 		if dur > 0 && o.from >= dur {
@@ -153,8 +214,27 @@ func convertVideo(ctx context.Context, o opts, in, part string, toMP4 bool) erro
 			dur = o.to - o.from
 		}
 	}
-	full = append(append(full, "-i", in), args...)
-	full = append(full, "-map_metadata", "0", "-map_chapters", "0", "-f", format, "-y", part)
+	if len(ins) > 1 {
+		list, err := concatList(ins)
+		if err != nil {
+			return err
+		}
+		defer os.Remove(list)
+		full = append(full, "-f", "concat", "-safe", "0", "-i", list)
+	} else {
+		full = append(full, "-i", ins[0])
+	}
+	full = append(full, args...)
+	meta := "0"
+	if o.strip {
+		meta = "-1" // общие теги файла: место съёмки, дата, устройство; язык дорожек остаётся
+	}
+	format := "matroska"
+	if toMP4 {
+		format = "mp4"
+	}
+	full = append(full, "-map_metadata:g", meta, "-map_chapters", "0", "-f", format, "-y", part)
+
 	cmd := exec.CommandContext(ctx, "ffmpeg", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -165,11 +245,31 @@ func convertVideo(ctx context.Context, o opts, in, part string, toMP4 bool) erro
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	showProgress(stdout, dur, filepath.Base(in))
+	showProgress(stdout, dur, filepath.Base(ins[0]))
 	if err := cmd.Wait(); err != nil {
 		return fmt.Errorf("ffmpeg: %v\n%s", err, strings.TrimSpace(stderr.String()))
 	}
+	if o.compress && totalSize(part) >= inSize {
+		return fmt.Errorf("%w (%s → %s)", errBigger, human(inSize), human(totalSize(part)))
+	}
 	return nil
+}
+
+// concatList — список файлов для склейки в формате ffmpeg concat.
+func concatList(ins []string) (string, error) {
+	f, err := os.CreateTemp("", "cv-join-*.txt")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	for _, in := range ins {
+		abs, err := filepath.Abs(in)
+		if err != nil {
+			return f.Name(), err
+		}
+		fmt.Fprintf(f, "file '%s'\n", strings.ReplaceAll(abs, "'", `'\''`))
+	}
+	return f.Name(), nil
 }
 
 func showProgress(r io.Reader, dur float64, name string) {

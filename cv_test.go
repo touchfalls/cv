@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,8 +41,8 @@ func TestVideo(t *testing.T) {
 	sh(t, "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=2",
 		"-f", "lavfi", "-i", "sine=d=2", "-f", "lavfi", "-i", "sine=f=880:d=2", "-i", srt,
 		"-map", "0", "-map", "1", "-map", "2", "-map", "3",
-		"-c:v", "libx264", "-c:a:0", "aac", "-c:a:1", "flac", "-c:s", "srt",
-		"-metadata:s:a:1", "language=rus", mkv)
+		"-c:v", "libx264", "-qp", "0", "-c:a:0", "aac", "-c:a:1", "flac", "-c:s", "srt",
+		"-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=rus", "-metadata", "location=+55.75+037.61/", mkv)
 	ctx := context.Background()
 
 	if run(ctx, opts{}, []string{mkv}) != 0 {
@@ -78,6 +84,49 @@ func TestVideo(t *testing.T) {
 	}
 	if run(ctx, opts{from: 100, out: filepath.Join(d, "late")}, []string{mkv}) != 1 {
 		t.Error("-from за концом видео должен дать ошибку")
+	}
+
+	// -res: 320x240 → 160x120
+	if run(ctx, opts{res: 120, out: filepath.Join(d, "res")}, []string{mkv}) != 0 {
+		t.Fatal("res")
+	}
+	if got := strings.TrimSpace(sh(t, "ffprobe", "-v", "error", "-select_streams", "v", "-show_entries", "stream=width,height", "-of", "csv=p=0", filepath.Join(d, "res", "in.mp4"))); got != "160,120" {
+		t.Errorf("res: %s", got)
+	}
+
+	// -audio rus -subs none: остаётся видео и одна русская дорожка
+	if run(ctx, opts{audio: []string{"ru"}, subs: []string{"none"}, out: filepath.Join(d, "tr")}, []string{mkv}) != 0 {
+		t.Fatal("tracks")
+	}
+	if got := streams(t, filepath.Join(d, "tr", "in.mp4")); got != "h264,avc1,und\naac,mp4a,rus" {
+		t.Errorf("tracks: %q", got)
+	}
+
+	// -strip: убирает место съёмки, но не язык дорожек
+	if run(ctx, opts{strip: true, out: filepath.Join(d, "strip")}, []string{mkv}) != 0 {
+		t.Fatal("strip")
+	}
+	if tags := sh(t, "ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "default", filepath.Join(d, "in.mp4")); !strings.Contains(tags, "55.75") {
+		t.Fatalf("без -strip location должен сохраняться: %s", tags)
+	}
+	sf := filepath.Join(d, "strip", "in.mp4")
+	if tags := sh(t, "ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "default", sf); strings.Contains(tags, "55.75") {
+		t.Errorf("strip: остался location: %s", tags)
+	}
+	if !strings.Contains(streams(t, sf), "rus") {
+		t.Error("strip: пропал язык дорожки")
+	}
+
+	// -join: два одинаковых файла → 4 секунды; разные файлы склеивать отказывается
+	if run(ctx, opts{join: true, out: filepath.Join(d, "j")}, []string{mkv, mkv}) != 0 {
+		t.Fatal("join")
+	}
+	dur := strings.TrimSpace(sh(t, "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", filepath.Join(d, "j", "in.joined.mkv")))
+	if v, _ := strconv.ParseFloat(dur, 64); v < 3.8 || v > 4.3 {
+		t.Errorf("join: длительность %s", dur)
+	}
+	if run(ctx, opts{join: true, out: filepath.Join(d, "j2")}, []string{mkv, filepath.Join(d, "res", "in.mp4")}) != 1 {
+		t.Error("join разных файлов должен дать ошибку")
 	}
 
 	// повторный запуск по папке ничего не ломает и не плодит файлов
@@ -122,5 +171,134 @@ func TestParseTime(t *testing.T) {
 		if _, err := parseTime(bad); err == nil {
 			t.Errorf("parseTime(%q) должен вернуть ошибку", bad)
 		}
+	}
+}
+
+// orientedJPEG — JPEG 400x200 с EXIF: поворот 6 (90° по часовой) и GPS-координаты, как у фото с телефона.
+func orientedJPEG(t *testing.T, path string, quality int) {
+	img := image.NewRGBA(image.Rect(0, 0, 400, 200))
+	for x := range 400 {
+		for y := range 200 {
+			img.Set(x, y, color.RGBA{uint8(x), uint8(y), 100, 255})
+		}
+	}
+	var j bytes.Buffer
+	if err := jpeg.Encode(&j, img, &jpeg.Options{Quality: quality}); err != nil {
+		t.Fatal(err)
+	}
+	be := binary.BigEndian
+	tf := []byte("MM\x00\x2a\x00\x00\x00\x08\x00\x02")
+	tf = append(tf, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0)  // Orientation = 6
+	tf = append(tf, 0x88, 0x25, 0, 4, 0, 0, 0, 1, 0, 0, 0, 38) // GPS IFD по смещению 38
+	tf = be.AppendUint32(tf, 0)
+	tf = be.AppendUint16(tf, 4)
+	tf = append(tf, 0, 1, 0, 2, 0, 0, 0, 2, 'N', 0, 0, 0)
+	tf = append(tf, 0, 2, 0, 5, 0, 0, 0, 3, 0, 0, 0, 92)
+	tf = append(tf, 0, 3, 0, 2, 0, 0, 0, 2, 'E', 0, 0, 0)
+	tf = append(tf, 0, 4, 0, 5, 0, 0, 0, 3, 0, 0, 0, 116)
+	tf = be.AppendUint32(tf, 0)
+	for _, v := range []uint32{55, 1, 45, 1, 0, 1, 37, 1, 37, 1, 0, 1} {
+		tf = be.AppendUint32(tf, v)
+	}
+	p := append([]byte("Exif\x00\x00"), tf...)
+	out := append([]byte{0xFF, 0xD8, 0xFF, 0xE1, byte((len(p) + 2) >> 8), byte(len(p) + 2)}, p...)
+	if err := os.WriteFile(path, append(out, j.Bytes()[2:]...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// exifOf возвращает TIFF-часть EXIF из JPEG (или nil).
+func exifOf(b []byte) []byte {
+	for i := 2; i+4 <= len(b) && b[i] == 0xFF && b[i+1] != 0xDA; {
+		n := int(b[i+2])<<8 | int(b[i+3])
+		if b[i+1] == 0xE1 && bytes.HasPrefix(b[i+4:], []byte("Exif\x00\x00")) {
+			return b[i+10 : i+2+n]
+		}
+		i += 2 + n
+	}
+	return nil
+}
+
+func hasGPS(tf []byte) bool {
+	return bytes.Contains(tf, []byte{0x88, 0x25}) || bytes.Contains(tf, []byte{0x25, 0x88})
+}
+
+func TestStripJPEG(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "p.jpg")
+	orientedJPEG(t, f, 75)
+	b, _ := os.ReadFile(f)
+	if !hasGPS(exifOf(b)) {
+		t.Fatal("в исходнике должен быть GPS")
+	}
+	s, err := stripJPEG(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tf := exifOf(s); hasGPS(tf) || tiffOrientation(tf) != 6 {
+		t.Errorf("после strip: GPS=%v, поворот=%d", hasGPS(tf), tiffOrientation(tf))
+	}
+	if _, err := jpeg.Decode(bytes.NewReader(s)); err != nil {
+		t.Errorf("JPEG сломан: %v", err)
+	}
+	if _, err := stripJPEG([]byte("garbage")); err == nil {
+		t.Error("мусор должен давать ошибку")
+	}
+}
+
+func TestPhotoFormats(t *testing.T) {
+	if _, err := exec.LookPath("sips"); err != nil {
+		t.Skip("нет sips")
+	}
+	d := t.TempDir()
+	src := filepath.Join(d, "p.jpg")
+	orientedJPEG(t, src, 50)
+	ctx := context.Background()
+
+	// -strip через весь путь sips: GPS нет, поворот сохранён
+	if run(ctx, opts{strip: true}, []string{src}) != 0 {
+		t.Fatal("strip")
+	}
+	b, _ := os.ReadFile(filepath.Join(d, "p.min.jpg"))
+	if tf := exifOf(b); hasGPS(tf) || tiffOrientation(tf) != 6 {
+		t.Errorf("strip: GPS=%v, поворот=%d", hasGPS(tf), tiffOrientation(tf))
+	}
+
+	// пересжатие JPEG→JPEG с q100 даст файл больше — результат не сохраняется, но это не ошибка
+	if run(ctx, opts{q: 100, out: filepath.Join(d, "big")}, []string{src}) != 0 {
+		t.Error("больший результат не должен давать ошибку")
+	}
+	if _, err := os.Stat(filepath.Join(d, "big", "p.min.jpg")); err == nil {
+		t.Error("больший результат не должен сохраняться")
+	}
+
+	// AVIF и HEIC пишет sips
+	for _, f := range []string{"avif", "heic"} {
+		if run(ctx, opts{format: f, strip: true}, []string{src}) != 0 {
+			t.Fatal(f)
+		}
+		if out := sh(t, "sips", "-g", "format", filepath.Join(d, "p."+f)); !strings.Contains(out, "format: "+f) {
+			t.Errorf("%s: %s", f, out)
+		}
+	}
+
+	// WebP: пиксели повёрнуты по EXIF, 400x200 → 200x400
+	if _, err := exec.LookPath("cwebp"); err != nil {
+		t.Skip("нет cwebp")
+	}
+	if run(ctx, opts{format: "webp"}, []string{src}) != 0 {
+		t.Fatal("webp")
+	}
+	if out := sh(t, "sips", "-g", "pixelWidth", "-g", "pixelHeight", filepath.Join(d, "p.webp")); !strings.Contains(out, "pixelWidth: 200") || !strings.Contains(out, "pixelHeight: 400") {
+		t.Errorf("webp не повёрнут: %s", out)
+	}
+}
+
+func TestParseFlags(t *testing.T) {
+	o, files, err := parseFlags([]string{"a.mkv", "-c", "b.mkv", "-audio", "RUS, eng", "-to", "30m"})
+	if err != nil || !slices.Equal(files, []string{"a.mkv", "b.mkv"}) || !o.compress || !slices.Equal(o.audio, []string{"rus", "eng"}) || o.to != 1800 || o.format != "jpg" {
+		t.Errorf("parseFlags: %+v %v %v", o, files, err)
+	}
+	if _, _, err := parseFlags([]string{"-f", "gif", "a.jpg"}); err == nil {
+		t.Error("-f gif должен давать ошибку")
 	}
 }
