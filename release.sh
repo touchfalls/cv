@@ -21,7 +21,9 @@ for arch in arm64 amd64; do
 done
 gh release create "$tag" "$dist"/cv-*.tar.gz --repo "$repo" --title "$tag" --generate-notes
 
-sha=$(curl -fsSL "https://github.com/$repo/archive/refs/tags/$tag.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+# Через файл, а не через трубу: иначе упавший curl дал бы sha256 пустоты.
+curl -fsSL --retry 3 -o "$dist/src.tar.gz" "https://github.com/$repo/archive/refs/tags/$tag.tar.gz"
+sha=$(shasum -a 256 "$dist/src.tar.gz" | cut -d' ' -f1)
 git clone -q "https://github.com/touchfalls/homebrew-tap" "$dist/tap"
 mkdir -p "$dist/tap/Formula"
 sed -e "/^# Шаблон/d" -e "s/@VERSION@/$v/g" -e "s/@SHA256@/$sha/" packaging/cv.rb > "$dist/tap/Formula/cv.rb"
