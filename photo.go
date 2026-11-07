@@ -39,8 +39,21 @@ func convertPhoto(ctx context.Context, o opts, in, part string) error {
 			resize = []string{"-Z", strconv.Itoa(o.max)}
 		}
 	}
-	tmp := part + ".tmp"
-	defer os.Remove(tmp)
+	tmpJPG, tmpTIFF := part+".tmp.jpg", part+".tmp.tiff"
+	defer os.Remove(tmpJPG)
+	defer os.Remove(tmpTIFF)
+	src := in
+	if o.strip && o.format != "jpg" {
+		// shortcut: метаданные чистим через промежуточный JPEG q100 — теряется прозрачность PNG;
+		// если понадобится, чистить EXIF прямо внутри HEIC/AVIF.
+		if err := sips(ctx, "-s", "format", "jpeg", "-s", "formatOptions", "100", resize, in, "--out", tmpJPG); err != nil {
+			return err
+		}
+		if err := stripFile(tmpJPG); err != nil {
+			return err
+		}
+		src, resize = tmpJPG, nil
+	}
 	switch o.format {
 	case "jpg":
 		if err := sips(ctx, "-s", "format", "jpeg", "-s", "formatOptions", qs, resize, in, "--out", part); err != nil {
@@ -51,38 +64,25 @@ func convertPhoto(ctx context.Context, o opts, in, part string) error {
 				return err
 			}
 		}
-	case "heic", "avif":
-		src := in
-		if o.strip {
-			// shortcut: метаданные чистим через промежуточный JPEG q100 — теряется прозрачность PNG;
-			// если понадобится, чистить EXIF прямо внутри HEIC/AVIF.
-			if err := sips(ctx, "-s", "format", "jpeg", "-s", "formatOptions", "100", resize, in, "--out", tmp); err != nil {
-				return err
-			}
-			if err := stripFile(tmp); err != nil {
-				return err
-			}
-			src, resize = tmp, nil
+	case "heic":
+		if err := sips(ctx, "-s", "format", "heic", "-s", "formatOptions", qs, resize, src, "--out", part); err != nil {
+			return err
 		}
-		if err := sips(ctx, "-s", "format", o.format, "-s", "formatOptions", qs, resize, src, "--out", part); err != nil {
+	case "avif":
+		// sips пишет поворот в AVIF так, что просмотрщики его игнорируют, — поворачиваем пиксели сами.
+		if err := bakeTIFF(ctx, src, resize, tmpTIFF); err != nil {
+			return err
+		}
+		if err := sips(ctx, "-s", "format", "avif", "-s", "formatOptions", qs, tmpTIFF, "--out", part); err != nil {
 			return err
 		}
 	case "webp":
-		// TIFF без потерь и с прозрачностью; поворот по EXIF применяем к пикселям сами.
-		if err := sips(ctx, "-s", "format", "tiff", resize, in, "--out", tmp); err != nil {
+		// cwebp не читает HEIC и не понимает EXIF-поворот.
+		if err := bakeTIFF(ctx, src, resize, tmpTIFF); err != nil {
 			return err
-		}
-		b, err := os.ReadFile(tmp)
-		if err != nil {
-			return err
-		}
-		for _, op := range orientOps[tiffOrientation(b)] {
-			if err := sips(ctx, op, tmp); err != nil {
-				return err
-			}
 		}
 		// -metadata icc: EXIF не переносим вовсе, так что WebP всегда без GPS.
-		if out, err := exec.CommandContext(ctx, "cwebp", "-quiet", "-q", qs, "-metadata", "icc", tmp, "-o", part).CombinedOutput(); err != nil {
+		if out, err := exec.CommandContext(ctx, "cwebp", "-quiet", "-q", qs, "-metadata", "icc", tmpTIFF, "-o", part).CombinedOutput(); err != nil {
 			return fmt.Errorf("cwebp: %v: %s", err, strings.TrimSpace(string(out)))
 		}
 	default:
@@ -114,6 +114,31 @@ func checkBigger(o opts, in, part string) error {
 		return os.WriteFile(part, s, 0o644)
 	}
 	return fmt.Errorf("%w (%s → %s)", errBigger, human(totalSize(in)), human(totalSize(part)))
+}
+
+// bakeTIFF делает TIFF (без потерь, с прозрачностью), где поворот применён к пикселям, а метка поворота = 1.
+func bakeTIFF(ctx context.Context, in string, resize []string, tiff string) error {
+	if err := sips(ctx, "-s", "format", "tiff", resize, in, "--out", tiff); err != nil {
+		return err
+	}
+	b, err := os.ReadFile(tiff)
+	if err != nil {
+		return err
+	}
+	ops := orientOps[tiffOrientation(b)]
+	if len(ops) == 0 {
+		return nil
+	}
+	for _, op := range ops {
+		if err := sips(ctx, op, tiff); err != nil {
+			return err
+		}
+	}
+	if b, err = os.ReadFile(tiff); err != nil { // sips -r переписал файл, метку поворота он не трогает
+		return err
+	}
+	tiffOrient(b, 1)
+	return os.WriteFile(tiff, b, 0o644)
 }
 
 func stripFile(p string) error {

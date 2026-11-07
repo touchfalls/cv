@@ -281,6 +281,11 @@ func TestPhotoFormats(t *testing.T) {
 		}
 	}
 
+	// AVIF: поворот применён к пикселям, 400x200 → 200x400
+	if out := sh(t, "sips", "-g", "pixelWidth", "-g", "pixelHeight", filepath.Join(d, "p.avif")); !strings.Contains(out, "pixelWidth: 200") || !strings.Contains(out, "pixelHeight: 400") {
+		t.Errorf("avif не повёрнут: %s", out)
+	}
+
 	// WebP: пиксели повёрнуты по EXIF, 400x200 → 200x400
 	if _, err := exec.LookPath("cwebp"); err != nil {
 		t.Skip("нет cwebp")

@@ -135,8 +135,9 @@ func splitList(s string) (r []string) {
 }
 
 type job struct {
-	ins []string // несколько — только при склейке
-	out string
+	ins     []string // несколько — только при склейке
+	out     string
+	partial bool // обрезка: сравнивать размер с целым исходником бессмысленно
 }
 
 // stats считает результаты для итоговой строки; фото обрабатываются параллельно, поэтому под мьютексом.
@@ -211,14 +212,14 @@ func run(ctx context.Context, o opts, args []string) int {
 			st.fail("для -join нужно хотя бы два видео")
 			return 1
 		}
-		vjobs = []job{{videos, outPath(videos[0], videoTarget(videos[0], o), o.out)}}
+		vjobs = []job{{videos, outPath(videos[0], videoTarget(videos[0], o), o.out), false}}
 	} else {
 		for _, v := range videos {
-			vjobs = append(vjobs, job{[]string{v}, outPath(v, videoTarget(v, o), o.out)})
+			vjobs = append(vjobs, job{[]string{v}, outPath(v, videoTarget(v, o), o.out), false})
 		}
 	}
 	for _, p := range photos {
-		pjobs = append(pjobs, job{[]string{p}, outPath(p, photoOut[o.format], o.out)})
+		pjobs = append(pjobs, job{[]string{p}, outPath(p, photoOut[o.format], o.out), false})
 	}
 	if len(pjobs) > 0 && o.format == "webp" {
 		if _, err := exec.LookPath("cwebp"); err != nil {
@@ -240,6 +241,9 @@ func run(ctx context.Context, o opts, args []string) int {
 		return r
 	}
 	vjobs, pjobs = drop(vjobs), drop(pjobs)
+	for i := range vjobs {
+		vjobs[i].partial = o.from > 0 || o.to > 0
+	}
 
 	for _, j := range vjobs {
 		if ctx.Err() != nil {
@@ -345,12 +349,16 @@ func (s *stats) process(j job, conv func(part string) error) {
 		return
 	}
 	inSize, outSize := totalSize(j.ins...), totalSize(j.out)
-	fmt.Printf("%s → %s  (%s → %s)\n", in, j.out, human(inSize), human(outSize))
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.done++
+	if j.partial {
+		fmt.Printf("%s → %s  (%s)\n", in, j.out, human(outSize))
+		return
+	}
+	fmt.Printf("%s → %s  (%s → %s)\n", in, j.out, human(inSize), human(outSize))
 	s.in += inSize
 	s.out += outSize
-	s.mu.Unlock()
 }
 
 func (s *stats) summary() {

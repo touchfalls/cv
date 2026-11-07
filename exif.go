@@ -59,7 +59,10 @@ func stripJPEG(b []byte) ([]byte, error) {
 }
 
 // tiffOrientation читает тег Orientation (0x0112) из IFD0 TIFF-структуры (EXIF внутри JPEG или файл .tiff).
-func tiffOrientation(t []byte) int {
+func tiffOrientation(t []byte) int { return tiffOrient(t, 0) }
+
+// tiffOrient читает Orientation; если set > 0 — заодно перезаписывает его этим значением.
+func tiffOrient(t []byte, set int) int {
 	if len(t) < 8 {
 		return 0
 	}
@@ -82,7 +85,11 @@ func tiffOrientation(t []byte) int {
 			return 0
 		}
 		if bo.Uint16(t[e:]) == 0x0112 {
-			return int(bo.Uint16(t[e+8:]))
+			o := int(bo.Uint16(t[e+8:]))
+			if set > 0 {
+				bo.PutUint16(t[e+8:], uint16(set))
+			}
+			return o
 		}
 	}
 	return 0
